@@ -1,9 +1,27 @@
 name: CI
 
+# ⚠️ TEMPORARY: workflow_dispatch only.
+#
+# Why: the account's GitHub Actions are locked by a billing issue
+# ("The job was not started because your account is locked due to a
+# billing issue."), so every push-triggered run fails before a runner
+# is allocated and shows red checks on every commit.
+#
+# HOW TO RESTORE FULL CI after resolving billing
+# (Settings → Billing and plans → fix payment / raise spending limit):
+#
+#   on:
+#     push:
+#       branches: [main]
+#     pull_request:
+#     workflow_dispatch:
+#
+# Until then, run CI manually: Actions tab → CI → Run workflow.
+# (The workflow itself is correct — it passed locally: 19/19 offline
+# unit tests + live registry smoke tests.)
+
 on:
-  push:
-    branches: [main]
-  pull_request:
+  workflow_dispatch:
 
 jobs:
   offline:
