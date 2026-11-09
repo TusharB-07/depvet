@@ -1,0 +1,24 @@
+cff-version: 1.2.0
+title: depvet — vet every dependency before your agent installs it
+message: >-
+  If you use depvet, please cite it using this metadata.
+type: software
+authors:
+  - name: TusharB-07
+repository-code: "https://github.com/TusharB-07/depvet"
+url: "https://github.com/TusharB-07/depvet"
+abstract: >-
+  An Agent Skills compatible skill that gates dependency installation for AI
+  coding agents. Vets npm and PyPI packages for typosquats, slopsquats,
+  confusable identities, dangerous lifecycle scripts, abandonment, and
+  license gaps before an install command runs.
+keywords:
+  - agent-skills
+  - supply-chain-security
+  - typosquatting
+  - slopsquatting
+  - npm
+  - pypi
+license: MIT
+version: 1.0.0
+date-released: "2026-11-09"

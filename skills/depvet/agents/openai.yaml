@@ -1,0 +1,4 @@
+interface:
+  display_name: "DepVet"
+  short_description: "Vet every dependency before your agent installs it"
+  default_prompt: "Use $depvet before installing any package in this session."

@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Syntax check
+        run: python3 -m py_compile scripts/depvet_check.py
+
+      - name: SKILL.md frontmatter is valid
+        run: |
+          python3 - <<'EOF'
+          import re, sys
+          md = open("skills/depvet/SKILL.md").read()
+          m = re.match(r"^---\n(.*?)\n---\n", md, re.DOTALL)
+          assert m, "SKILL.md must start with YAML frontmatter"
+          fm = m.group(1)
+          assert re.search(r"^name:\s*depvet\s*$", fm, re.M), "missing name: depvet"
+          assert re.search(r"^description:\s*>", fm, re.M), "missing description block"
+          print("frontmatter OK")
+          EOF
+
+      - name: Live registry smoke test (npm PASS path)
+        run: python3 scripts/depvet_check.py react
+
+      - name: JSON output is valid JSON
+        run: python3 scripts/depvet_check.py --json react | python3 -m json.tool > /dev/null
+
+      - name: BLOCK path exits 2 (slopsquat name)
+        run: |
+          if python3 scripts/depvet_check.py definitely-not-a-real-package-xyz; then
+            echo "expected non-zero exit"; exit 1
+          fi
