@@ -9,7 +9,6 @@ and dead packages — <i>before</i> <code>npm install</code> runs, not after.</p
   <a href="https://agentskills.io"><img src="https://img.shields.io/badge/Agent_Skills-compatible-1b1b19?style=flat-square" alt="Agent Skills compatible"></a>
   <img src="https://img.shields.io/badge/dependencies-0-1b1b19?style=flat-square" alt="Zero dependencies">
   <img src="https://img.shields.io/badge/python-%E2%89%A53.8-1b1b19?style=flat-square&logo=python&logoColor=white" alt="Python 3.8+">
-  <a href=".github/workflows/ci.yml"><img src="https://github.com/TusharB-07/depvet/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
 </p>
 
 ---
