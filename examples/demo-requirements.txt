@@ -1,0 +1,10 @@
+# Demo file for depvet's requirements.txt mode.
+#
+#   python3 scripts/depvet_check.py --requirements demo-requirements.txt
+#
+# Expected (live): `reqests` BLOCKs as a typosquat of `requests`;
+# `requests` and `flask` PASS.
+
+requests==2.31.0
+flask>=3.0
+reqests

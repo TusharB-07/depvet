@@ -43,6 +43,9 @@ jobs:
       - name: Unit tests (offline, pure functions)
         run: python3 tests/test_offline.py
 
+      - name: GitHub Action logic (offline simulation)
+        run: python3 tests/test_action.py
+
       - name: CLI is runnable
         run: python3 scripts/depvet_check.py --help > /dev/null
 
@@ -59,6 +62,10 @@ jobs:
           python-version: "3.12"
       - name: Live npm smoke test
         run: python3 scripts/depvet_check.py react
+      - name: Live lockfile scan
+        run: |
+          printf '{"lockfileVersion":3,"packages":{"":{"name":"t"},"node_modules/express":{"version":"4.19.2"}}}' > /tmp/package-lock.json
+          python3 scripts/depvet_check.py --lockfile /tmp/package-lock.json
       - name: Live JSON output
         run: python3 scripts/depvet_check.py --json lodash | python3 -m json.tool > /dev/null
       - name: Live BLOCK exit code

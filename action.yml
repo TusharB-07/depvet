@@ -1,0 +1,92 @@
+# depvet as a reusable GitHub Action.
+#
+# Gate PRs that add dependencies: scans a lockfile (npm) or a requirements
+# file (PyPI) plus any explicit package names, and fails the job when a
+# BLOCK is found (or a WARN, with strict: true).
+#
+# Example workflow in the consumer repo:
+#
+#   name: depvet
+#   on:
+#     pull_request:
+#       paths: ['package-lock.json', 'requirements*.txt']
+#   jobs:
+#     vet:
+#       runs-on: ubuntu-latest
+#       steps:
+#         - uses: actions/checkout@v4
+#         - uses: TusharB-07/depvet@v1
+#           with:
+#             lockfile: package-lock.json
+#             strict: true
+
+name: 'depvet dependency gate'
+description: 'Vet dependencies for typosquats, slopsquats, dangerous install scripts and dead packages before they are installed.'
+branding:
+  icon: 'shield'
+  color: 'red'
+
+inputs:
+  lockfile:
+    description: 'package-lock.json / npm-shrinkwrap.json path(s), whitespace-separated'
+    required: false
+    default: ''
+  requirements:
+    description: 'requirements*.txt path(s), whitespace-separated'
+    required: false
+    default: ''
+  packages:
+    description: 'explicit package name(s) to vet, whitespace-separated'
+    required: false
+    default: ''
+  registry:
+    description: 'registry for the packages input only: npm (default) or pypi'
+    required: false
+    default: 'npm'
+  strict:
+    description: '"true" = fail the job on WARN too (BLOCK always fails)'
+    required: false
+    default: 'false'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Vet dependencies
+      shell: bash
+      run: |
+        set -euo pipefail
+        SCRIPT="${{ github.action_path }}/scripts/depvet_check.py"
+        ARGS=()
+
+        for f in ${{ inputs.lockfile }}; do
+          if [ -f "$f" ]; then
+            ARGS+=(--lockfile "$f")
+          else
+            echo "::warning::lockfile '$f' not found in $(pwd) - skipping"
+          fi
+        done
+
+        for f in ${{ inputs.requirements }}; do
+          if [ -f "$f" ]; then
+            ARGS+=(--requirements "$f")
+          else
+            echo "::warning::requirements file '$f' not found in $(pwd) - skipping"
+          fi
+        done
+
+        if [ "${{ inputs.strict }}" = "true" ]; then
+          ARGS+=(--strict)
+        fi
+
+        PKGS=()
+        for p in ${{ inputs.packages }}; do
+          PKGS+=("$p")
+        done
+
+        if [ ${#ARGS[@]} -eq 0 ] && [ ${#PKGS[@]} -eq 0 ]; then
+          echo "::error::depvet: nothing to vet - set 'lockfile', 'requirements' or 'packages'"
+          exit 1
+        fi
+
+        python3 "$SCRIPT" ${ARGS[@]+"${ARGS[@]}"} ${PKGS[@]+"${PKGS[@]}"} \
+          --registry "${{ inputs.registry }}" --max-delay 0

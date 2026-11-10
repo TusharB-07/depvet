@@ -8,15 +8,20 @@ Works standalone, or as the checker invoked by the depvet agent skill.
 Usage:
   python3 depvet_check.py react axios lodash          # npm (default)
   python3 depvet_check.py --registry pypi requests    # PyPI
+  python3 depvet_check.py --lockfile package-lock.json   # every dep in a lockfile
+  python3 depvet_check.py --requirements requirements.txt  # every dep, PyPI
   python3 depvet_check.py --json react                # machine-readable
   python3 depvet_check.py --strict react some-lib     # treat WARN as failure
+  python3 depvet_check.py --allow axios react         # silence a reviewed WARN
 
-Exit codes: 0 = all PASS, 1 = at least one WARN, 2 = at least one BLOCK/NOTFOUND,
-            3 = network/regional failure.
+Exit codes: 0 = all PASS, 1 = at least one WARN (--strict escalates),
+            2 = at least one BLOCK/NOTFOUND, 3 = network/regional failure.
 """
 
 import argparse
+import hashlib
 import json
+import os
 import re
 import sys
 import time
@@ -29,7 +34,7 @@ NPM_DOWNLOADS = "https://api.npmjs.org/downloads/point/last-week"
 PYPI_REGISTRY = "https://pypi.org/pypi"
 
 TIMEOUT = 15
-UA = "depvet/1.0 (agent dependency gate)"
+UA = "depvet/1.1 (agent dependency gate)"
 
 # --------------------------------------------------------------------------
 # Popular-package lists used for typosquat / slopsquat distance checks.
@@ -122,6 +127,26 @@ INSTALL_SCRIPT_KEYS = [
 # --------------------------------------------------------------------------
 
 def http_get_json(url: str):
+    # Test hook: when DEPVET_FIXTURES points to a directory, responses come
+    # from files named sha256(url)[:24].json (body = JSON, "404", or "ERR").
+    fx = os.environ.get("DEPVET_FIXTURES")
+    if fx:
+        fname = hashlib.sha256(url.encode("utf-8")).hexdigest()[:24] + ".json"
+        path = os.path.join(fx, fname)
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                raw = fh.read().strip()
+        except OSError:
+            return None, f"fixture missing: {fname}"
+        if raw == "404":
+            return None, "notfound"
+        if raw == "ERR":
+            return None, "simulated failure"
+        try:
+            return json.loads(raw), None
+        except ValueError:
+            return None, "fixture is not valid JSON"
+
     req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
@@ -201,6 +226,105 @@ def empty_meta():
 
 
 # --------------------------------------------------------------------------
+# Manifest / lockfile parsing and allowlist (pure functions - unit tested)
+# --------------------------------------------------------------------------
+
+def parse_package_lock(doc):
+    """Extract dependency names from a package-lock.json dict (v1, v2, v3).
+
+    v2/v3 use a flat "packages" map keyed by "node_modules/<name>" paths
+    (possibly nested); v1 uses a recursive "dependencies" tree. The event-
+    stream and eslint-scope compromises both arrived through transitive
+    dependencies, which is exactly why the whole locked tree gets vetted.
+    """
+    names = []
+    pkgs = doc.get("packages")
+    if isinstance(pkgs, dict):
+        for key in pkgs:
+            if not isinstance(key, str) or key == "":
+                continue  # root entry / malformed
+            parts = key.split("node_modules/")
+            if len(parts) > 1 and parts[-1]:
+                names.append(parts[-1])
+        return sorted(set(names))
+    deps = doc.get("dependencies")
+    if isinstance(deps, dict):
+        def walk(subtree):
+            for k, v in subtree.items():
+                names.append(k)
+                if isinstance(v, dict) and isinstance(v.get("dependencies"), dict):
+                    walk(v["dependencies"])
+        walk(deps)
+        return sorted(set(names))
+    return []
+
+
+def parse_requirements_line(line: str):
+    """Parse one requirements.txt line into a bare package name (or None).
+
+    Ignores comments, blank lines, options (-r/--index-url/...), editable
+    installs, VCS/URL deps, environment markers and extras.
+    """
+    line = line.split("#", 1)[0].strip()
+    if not line or line.startswith("-"):
+        return None
+    if "://" in line:  # VCS or direct-URL dep - not vettable by name
+        return None
+    line = line.split(";", 1)[0]      # environment marker
+    line = line.split("[", 1)[0]      # extras
+    for op in ("~", "<", ">", "=", "!"):  # version specifier (~= first: ~= contains =)
+        idx = line.find(op)
+        if idx > 0:
+            line = line[:idx]
+            break
+    return line.strip() or None
+
+
+def parse_requirements(lines):
+    """Parse requirements.txt content (iterable of lines) into names."""
+    out = []
+    for line in lines:
+        name = parse_requirements_line(line)
+        if name:
+            out.append(name)
+    return sorted(set(out))
+
+
+def load_allowlist(path: str):
+    """Load a .depvetrc.json-style allowlist: {"allow": {"name": "reason"}}.
+
+    Returns dict (possibly empty), or None if the file exists but is broken.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError):
+        return None
+    allow = doc.get("allow") if isinstance(doc, dict) else None
+    if not isinstance(allow, dict):
+        return {}
+    return {str(k).lower(): str(v or "reviewed") for k, v in allow.items()}
+
+
+def apply_allowlist(results, allow):
+    """Downgrade WARN -> PASS for allowlisted packages (reason recorded).
+
+    BLOCK and ERROR are never downgraded: an allowlist documents trust, it
+    does not override evidence of a typosquat or a dangerous install script.
+    """
+    if not allow:
+        return results
+    for r in results:
+        reason = allow.get(r["name"].lower())
+        if reason and r["verdict"] == "WARN":
+            r["verdict"] = "PASS"
+            r.setdefault("notes", []).append(f"WARN suppressed by allowlist ({reason})")
+    return results
+
+
+# --------------------------------------------------------------------------
 # Registry checks
 # --------------------------------------------------------------------------
 
@@ -274,6 +398,19 @@ def check_npm(name: str, opts):
     if (repo is None or (isinstance(repo, dict) and not repo_url)) and n_maint <= 1 \
             and weekly is not None and weekly < 1000:
         flags.append("no source repository, single maintainer, low adoption - unaccountable provenance")
+
+    deprecated = latest.get("deprecated")
+    if deprecated:
+        # Deprecated packages stay installable and keep running their install
+        # scripts; takedown-squats are often deprecated in place rather than
+        # removed (see references/red-flags.md #11).
+        warnings.append(f"deprecated on npm: {str(deprecated)[:110]}")
+
+    has_attestations = bool((latest.get("dist") or {}).get("attestations"))
+    if has_attestations:
+        notes.append("npm provenance attestations present")
+    elif age_days is not None and age_days < opts.fresh_days:
+        warnings.append("brand-new package without npm provenance attestations")
 
     if n_maint <= 1:
         warnings.append("single maintainer (bus factor / account-takeover blast radius)")
@@ -357,6 +494,12 @@ def check_pypi(name: str, opts):
     if age_days is not None and age_days < opts.fresh_days and n_versions <= 2:
         flags.append(f"package is {age_days} days old with {n_versions} release(s) - fresh-drop profile")
 
+    latest_ver = info.get("version")
+    latest_files = releases.get(latest_ver) or []
+    yanked = [f for f in latest_files if f.get("yanked")]
+    if latest_files and len(yanked) == len(latest_files):
+        warnings.append(f"latest release {latest_ver} is yanked from PyPI")
+
     if n_versions <= 2:
         warnings.append(f"only {n_versions} release(s) - no track record")
     if age_days is not None and age_days < opts.fresh_days * 3:
@@ -393,6 +536,10 @@ COLOR = {"BLOCK": "\033[1;31m", "WARN": "\033[1;33m", "PASS": "\033[1;32m", "ERR
 BOLD, RESET = "\033[1m", "\033[0m"
 
 
+def visible_len(s: str) -> int:
+    return len(re.sub(r"\033\[[0-9;]*m", "", s))
+
+
 def render_table(results):
     header = ["PACKAGE", "VERDICT", "AGE", "DOWNLOADS", "MAINT", "SCRIPTS", "LICENSE"]
     rows = []
@@ -411,11 +558,8 @@ def render_table(results):
     for row, raw in zip(rows, results):
         colored = list(row)
         colored[1] = COLOR.get(row[1], "") + row[1] + RESET
-        # width accounting: strip ANSI for padding
-        out.append("  ".join(
-            (c if i == 1 else c.ljust(w)) if i == 1 else c.ljust(w)
-            for i, (c, w) in enumerate(zip(colored, widths))
-        ))
+        # pad every cell to its visible width (strip ANSI before measuring)
+        out.append("  ".join(c + " " * (w - visible_len(c)) for c, w in zip(colored, widths)))
         for f in raw.get("flags", []):
             out.append(f"    [BLOCK] {f}")
         for w in raw.get("warnings", []):
@@ -425,33 +569,94 @@ def render_table(results):
 
 def main():
     ap = argparse.ArgumentParser(prog="depvet", description="Vet packages before installing them.")
-    ap.add_argument("packages", nargs="+", help="package name(s) to vet")
-    ap.add_argument("--registry", choices=["npm", "pypi"], default="npm")
+    ap.add_argument("packages", nargs="*", help="package name(s) to vet")
+    ap.add_argument("--registry", choices=["npm", "pypi"], default=None,
+                    help="defaults to npm for names, pypi for --requirements, npm for --lockfile")
+    ap.add_argument("--lockfile", action="append", metavar="FILE",
+                    help="vet every dependency in a package-lock.json / npm-shrinkwrap.json (repeatable)")
+    ap.add_argument("--requirements", action="append", metavar="FILE",
+                    help="vet every dependency in a requirements*.txt file (repeatable)")
+    ap.add_argument("--allow", action="append", metavar="NAME",
+                    help="downgrade WARN to PASS for this reviewed package (repeatable; BLOCK is never downgraded)")
     ap.add_argument("--json", action="store_true", help="emit JSON instead of a table")
     ap.add_argument("--strict", action="store_true", help="exit non-zero on WARN too")
     ap.add_argument("--fresh-days", type=int, default=21, help="age threshold for 'fresh drop' (default 21)")
     ap.add_argument("--max-delay", type=float, default=1.0, help="max seconds between lookups")
     opts = ap.parse_args()
 
-    results = []
-    for i, pkg in enumerate(opts.packages):
-        if i:
-            time.sleep(min(opts.max_delay, 0.4))
+    # ---- collect the vetting jobs: (registry, name) pairs --------------------
+    jobs = []          # [(registry, name)], order = input order
+    sources = []       # human-readable provenance of the job list
+
+    for path in opts.lockfile or []:
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                doc = json.load(fh)
+        except (OSError, ValueError) as e:
+            print(f"depvet: cannot read lockfile {path}: {e}", file=sys.stderr)
+            sys.exit(3)
+        names = parse_package_lock(doc)
+        if not names:
+            print(f"depvet: no dependencies found in {path} (not a package-lock.json?)", file=sys.stderr)
+            sys.exit(3)
+        jobs += [("npm", n) for n in names]
+        sources.append(f"{len(names)} deps from {path}")
+
+    for path in opts.requirements or []:
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                names = parse_requirements(fh)
+        except OSError as e:
+            print(f"depvet: cannot read requirements file {path}: {e}", file=sys.stderr)
+            sys.exit(3)
+        if not names:
+            print(f"depvet: no dependencies found in {path}", file=sys.stderr)
+            sys.exit(3)
+        jobs += [("pypi", n) for n in names]
+        sources.append(f"{len(names)} deps from {path}")
+
+    for pkg in opts.packages:
         pkg = pkg.strip()
         if not pkg or pkg.startswith("-"):
             continue
-        results.append(CHECKERS[opts.registry](pkg, opts))
+        jobs.append((opts.registry or "npm", pkg))
+    if not jobs:
+        ap.error("give package names, --lockfile FILE, or --requirements FILE")
 
+    # ---- allowlist: .depvetrc.json (cwd) merged with --allow flags -----------
+    allow = load_allowlist(".depvetrc.json")
+    if allow is None:
+        print("depvet: .depvetrc.json exists but is not valid JSON - ignoring it", file=sys.stderr)
+        allow = {}
+    for name in opts.allow or []:
+        allow[name.lower()] = "CLI --allow flag"
+
+    # ---- run ----------------------------------------------------------------
+    results = []
+    for i, (reg, pkg) in enumerate(jobs):
+        if i:
+            time.sleep(min(opts.max_delay, 0.4))
+        r = CHECKERS[reg](pkg, opts)
+        r["registry"] = reg
+        results.append(r)
+
+    results = apply_allowlist(results, allow)
     results.sort(key=lambda r: ORDER.get(r["verdict"], 9))
 
     if opts.json:
-        print(json.dumps({"registry": opts.registry, "results": results}, indent=2))
+        print(json.dumps({
+            "registry": opts.registry or ("npm" if not opts.requirements else "pypi"),
+            "sources": sources,
+            "results": results,
+        }, indent=2))
     else:
         print(render_table(results))
         blocked = [r["name"] for r in results if r["verdict"] == "BLOCK"]
         warned = [r["name"] for r in results if r["verdict"] == "WARN"]
         errors = [r["name"] for r in results if r["verdict"] == "ERROR"]
         print()
+        if sources:
+            print(f"scanned {len(results)} packages ({'; '.join(sources)})")
         if blocked:
             print(f"{COLOR['BLOCK']}BLOCKED:{RESET} {', '.join(blocked)} - do NOT install. "
                   f"Ask the user how to proceed.")

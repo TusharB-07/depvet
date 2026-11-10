@@ -50,11 +50,19 @@ registries read-only and prints a verdict table:
 ```bash
 python3 scripts/depvet_check.py <package> [more packages...]            # npm
 python3 scripts/depvet_check.py --registry pypi <package> [...]         # PyPI
+python3 scripts/depvet_check.py --lockfile package-lock.json            # whole locked tree
+python3 scripts/depvet_check.py --requirements requirements.txt         # PyPI manifest
 python3 scripts/depvet_check.py --json <package>                        # machine-readable
 ```
 
-Exit codes: `0` all PASS · `1` at least one WARN · `2` at least one BLOCK.
-In CI or non-interactive runs, treat exit `2` as a hard stop.
+Exit codes: `0` all PASS · `1` at least one WARN (with `--strict`) ·
+`2` at least one BLOCK. In CI or non-interactive runs, treat exit `2` as a
+hard stop.
+
+If the project root contains `.depvetrc.json`, WARN verdicts for allowlisted
+packages are already downgraded to PASS with the review reason recorded.
+BLOCK verdicts are NEVER downgraded by the allowlist — treat every BLOCK as
+final until the user decides.
 
 ### Step 2 — Manual fallback (no script available)
 
@@ -93,10 +101,13 @@ to install, what you blocked or want confirmed, and why. Example:
 - **AI-suggested package names** (yours or another model's): a name that does
   not exist is a slopsquat target. Never "approximate" it into existence.
   Report BLOCK and ask. Background: [references/incidents.md](references/incidents.md).
-- **Transitive dependencies**: you only vet direct adds. If the user asks for
-  a full audit, run the checker on `package.json` dependencies top-down and
-  say clearly that deep-tree scanning is out of scope (point them to
-  `npm audit`, Socket, or Snyk for continuous scanning).
+- **Transitive dependencies**: you vet direct adds as they come up. For a
+  whole-tree audit, run the checker in batch mode on the project's manifests:
+  `--lockfile package-lock.json` (covers every pinned direct and nested
+  transitive dependency) and `--requirements requirements.txt` for PyPI.
+  Summarize the worst offenders; do not paste 200 rows. For continuous
+  monitoring or dependency *resolution* behavior, point the user at
+  `npm audit`, Socket, or Snyk.
 - **Version pins**: vet the package, then pin the resolved version. If the
   user asks for `latest`, still record the version you resolved.
 - **Workspace/monorepo adds**: same rules; vet once per distinct package.

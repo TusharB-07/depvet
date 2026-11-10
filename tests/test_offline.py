@@ -1,9 +1,20 @@
 #!/usr/bin/env python3
-"""Offline unit tests for depvet's pure logic. No network access needed."""
+"""Offline unit tests for depvet's pure logic. No network access needed.
 
+Covers pure functions (distance, canon, script scan, manifest parsing,
+allowlist) plus end-to-end CLI runs against local fixture files via the
+DEPVET_FIXTURES hook - the full pipeline, deterministically, offline.
+"""
+
+import hashlib
 import importlib.util
+import json
 import os
+import re
+import shutil
+import subprocess
 import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -68,6 +79,212 @@ check("established: 400d old does not flag", not (400 < Opts.fresh_days))
 # --- plumbing ----------------------------------------------------------------
 check("empty_meta has no verdict key", "verdict" not in mod.empty_meta())
 check("ORDER sorts BLOCK first", list(sorted(mod.ORDER, key=lambda k: mod.ORDER[k]))[0] == "BLOCK")
+
+# --- package-lock.json parsing (v1 / v2 / v3) ---------------------------------
+lock_v3 = {
+    "name": "app", "lockfileVersion": 3,
+    "packages": {
+        "": {"name": "app", "dependencies": {"safe-lib": "^1.0.0"}},
+        "node_modules/safe-lib": {"version": "1.0.0"},
+        "node_modules/ghost-lib": {"version": "0.1.0"},
+        "node_modules/safe-lib/node_modules/nested-pkg": {"version": "2.0.0"},
+    },
+}
+names = mod.parse_package_lock(lock_v3)
+check("lock v3 extracts flat deps", names == ["ghost-lib", "nested-pkg", "safe-lib"])
+check("lock v3 ignores root entry", "" not in names and "app" not in names)
+
+lock_v1 = {
+    "lockfileVersion": 1,
+    "dependencies": {
+        "safe-lib": {"version": "1.0.0", "dependencies": {"ghost-lib": {"version": "0.1.0"}}},
+        "deduped": {"version": "3.0.0"},
+    },
+}
+check("lock v1 walks recursive tree",
+      mod.parse_package_lock(lock_v1) == ["deduped", "ghost-lib", "safe-lib"])
+check("empty lock yields no names", mod.parse_package_lock({"lockfileVersion": 3}) == [])
+
+# --- requirements.txt parsing --------------------------------------------------
+req_lines = [
+    "# core deps",
+    "requests==2.31.0",
+    "click>=8.0 ; python_version >= '3.8'",
+    "rich[sqla]",
+    "-e ./editable",
+    "-r base.txt",
+    "--index-url https://pypi.org/simple",
+    "git+https://github.com/x/y.git#egg=z",
+    "",
+    "numpy~=1.26",
+]
+check("requirements parses names", mod.parse_requirements(req_lines) == ["click", "numpy", "requests", "rich"])
+check("requirements line keeps bare name", mod.parse_requirements_line("flask") == "flask")
+check("requirements drops VCS/URL lines", mod.parse_requirements_line("https://x/y.whl") is None)
+
+# --- allowlist -----------------------------------------------------------------
+allow = {"deprecated-lib": "audited 2026-11, accepted single-maintainer WARN"}
+res = [{"name": "deprecated-lib", "verdict": "WARN", "notes": []},
+       {"name": "ghost-lib", "verdict": "BLOCK", "notes": []},
+       {"name": "safe-lib", "verdict": "WARN", "notes": []}]
+out = mod.apply_allowlist(res, allow)
+check("allowlist downgrades matching WARN", out[0]["verdict"] == "PASS")
+check("allowlist records reason in notes", any("allowlist" in n for n in out[0]["notes"]))
+check("allowlist never downgrades BLOCK", out[1]["verdict"] == "BLOCK")
+check("allowlist leaves unmatched packages", out[2]["verdict"] == "WARN")
+check("apply_allowlist no-op on empty map", mod.apply_allowlist(res, {})[1]["verdict"] == "BLOCK")
+
+with tempfile.TemporaryDirectory() as td:
+    rc = os.path.join(td, ".depvetrc.json")
+    with open(rc, "w") as fh:
+        json.dump({"allow": {"x": "reviewed"}}, fh)
+    check("load_allowlist reads rc file", mod.load_allowlist(rc) == {"x": "reviewed"})
+    check("load_allowlist missing file -> {}", mod.load_allowlist(os.path.join(td, "nope.json")) == {})
+    with open(rc, "w") as fh:
+        fh.write("{broken json")
+    check("load_allowlist broken file -> None", mod.load_allowlist(rc) is None)
+
+# --------------------------------------------------------------------------
+# End-to-end CLI runs against local fixtures (DEPVET_FIXTURES hook)
+# --------------------------------------------------------------------------
+
+def fixture_dir(url: str, body: str, base: str) -> str:
+    fname = hashlib.sha256(url.encode("utf-8")).hexdigest()[:24] + ".json"
+    with open(os.path.join(base, fname), "w") as fh:
+        fh.write(body)
+    return fname
+
+NPM_META = "https://registry.npmjs.org/{}"
+NPM_DL = "https://api.npmjs.org/downloads/point/last-week/{}"
+PYPI_META = "https://pypi.org/pypi/{}/json"
+
+
+def npm_packument(deprecated=None, n_maint=2, age_created="2020-01-01T00:00:00Z",
+                  latest_time="2026-11-01T00:00:00Z", attestations=False):
+    latest = {"license": "MIT", "repository": {"url": "git+https://github.com/x/y.git"},
+              "scripts": {}}
+    if deprecated:
+        latest["deprecated"] = deprecated
+    if attestations:
+        latest["dist"] = {"attestations": {"url": "https://example.internal"}}
+    return json.dumps({
+        "dist-tags": {"latest": "1.0.0"},
+        "time": {"created": age_created, "1.0.0": latest_time},
+        "maintainers": [{} for _ in range(n_maint)],
+        "versions": {"1.0.0": latest},
+    })
+
+
+tmp = tempfile.mkdtemp(prefix="depvet-fixtures-")
+try:
+    fixture_dir(NPM_META.format("safe-lib"), npm_packument(), tmp)
+    fixture_dir(NPM_DL.format("safe-lib"), json.dumps({"downloads": 90000}), tmp)
+    fixture_dir(NPM_META.format("deprecated-lib"), npm_packument(deprecated="use safe-lib instead", n_maint=1), tmp)
+    fixture_dir(NPM_DL.format("deprecated-lib"), json.dumps({"downloads": 3000}), tmp)
+    fixture_dir(NPM_META.format("ghost-lib"), "404", tmp)
+    fixture_dir(NPM_DL.format("ghost-lib"), json.dumps({"downloads": 0}), tmp)
+    fixture_dir(PYPI_META.format("requests"),
+                json.dumps({"info": {"version": "2.31.0", "license": "Apache-2.0",
+                                     "project_urls": {"Homepage": "https://requests.io"}},
+                            "releases": {"1.0.0": [{"upload_time_iso_8601": "2020-01-01T00:00:00Z",
+                                                    "yanked": False}],
+                                         "1.5.0": [{"upload_time_iso_8601": "2023-06-01T00:00:00Z",
+                                                    "yanked": False}],
+                                         "2.31.0": [{"upload_time_iso_8601": "2026-10-01T00:00:00Z",
+                                                     "yanked": False}]}}), tmp)
+    fixture_dir(PYPI_META.format("yankme"),
+                json.dumps({"info": {"version": "1.0.0", "license": "MIT",
+                                     "project_urls": {"Homepage": "https://y.io"}},
+                            "releases": {"1.0.0": [{"upload_time_iso_8601": "2020-01-01T00:00:00Z",
+                                                    "yanked": True}]}}), tmp)
+
+    SCRIPT = os.path.join(ROOT, "scripts", "depvet_check.py")
+    base_env = dict(os.environ, DEPVET_FIXTURES=tmp)
+
+    def run_cli(args, cwd=None):
+        return subprocess.run([sys.executable, SCRIPT] + args, capture_output=True,
+                              text=True, env=base_env, cwd=cwd, timeout=60)
+
+    # JSON pipeline: verdicts, per-result registry, exit codes
+    p = run_cli(["--json", "--max-delay", "0", "safe-lib", "deprecated-lib", "ghost-lib"])
+    check("cli json exit 2 on BLOCK", p.returncode == 2)
+    out = json.loads(p.stdout)
+    verdicts = {r["name"]: r["verdict"] for r in out["results"]}
+    check("cli safe-lib PASS", verdicts["safe-lib"] == "PASS")
+    check("cli deprecated-lib WARN", verdicts["deprecated-lib"] == "WARN")
+    check("cli ghost-lib BLOCK (404)", verdicts["ghost-lib"] == "BLOCK")
+    check("cli results carry registry field", all(r.get("registry") == "npm" for r in out["results"]))
+    dep_r = next(r for r in out["results"] if r["name"] == "deprecated-lib")
+    check("cli deprecated warning surfaced", any("deprecated on npm" in w for w in dep_r["warnings"]))
+    check("cli new-fresh provenance warn only for young", not any("provenance" in w for w in dep_r["warnings"]))
+
+    # --strict escalates WARN
+    p = run_cli(["--json", "--strict", "--max-delay", "0", "deprecated-lib"])
+    check("cli --strict exit 1 on WARN", p.returncode == 1)
+
+    # allowlist via rc file in cwd
+    cwd2 = tempfile.mkdtemp(prefix="depvet-cwd-")
+    try:
+        with open(os.path.join(cwd2, ".depvetrc.json"), "w") as fh:
+            json.dump({"allow": {"deprecated-lib": "audited 2026-11"}}, fh)
+        p = run_cli(["--json", "--max-delay", "0", "deprecated-lib"], cwd=cwd2)
+        out = json.loads(p.stdout)
+        r = next(r for r in out["results"] if r["name"] == "deprecated-lib")
+        check("rc allowlist downgrades WARN to PASS", r["verdict"] == "PASS")
+        check("rc allowlist notes reason", any("audited 2026-11" in n for n in r["notes"]))
+        check("rc allowlist exit 0", p.returncode == 0)
+    finally:
+        shutil.rmtree(cwd2, ignore_errors=True)
+
+    # --allow flag; BLOCK stays BLOCK even if allowlisted
+    p = run_cli(["--json", "--max-delay", "0", "--allow", "ghost-lib", "ghost-lib"])
+    out = json.loads(p.stdout)
+    check("--allow cannot rescue a BLOCK", out["results"][0]["verdict"] == "BLOCK")
+
+    # lockfile mode (v3, with nested dep)
+    lockpath = os.path.join(tmp, "package-lock.json")
+    with open(lockpath, "w") as fh:
+        json.dump(lock_v3, fh)
+    p = run_cli(["--json", "--max-delay", "0", "--lockfile", lockpath])
+    out = json.loads(p.stdout)
+    got = sorted(r["name"] for r in out["results"])
+    check("lockfile mode scans every dep incl nested", got == ["ghost-lib", "nested-pkg", "safe-lib"])
+    check("lockfile mode records source", any("package-lock.json" in s for s in out.get("sources", [])))
+    check("lockfile mode exit 2 (ghost-lib)", p.returncode == 2)
+
+    # requirements mode -> pypi, yanked warning
+    reqpath = os.path.join(tmp, "requirements.txt")
+    with open(reqpath, "w") as fh:
+        fh.write("# comment\nrequests==2.31.0\nyankme>=1.0\n")
+    p = run_cli(["--json", "--max-delay", "0", "--requirements", reqpath])
+    out = json.loads(p.stdout)
+    got = {r["name"]: r for r in out["results"]}
+    check("requirements mode maps to pypi", all(r.get("registry") == "pypi" for r in out["results"]))
+    check("requirements mode scans parsed names", set(got) == {"requests", "yankme"})
+    check("yanked latest release warns", any("yanked" in w for w in got["yankme"]["warnings"]))
+    check("requests passes on pypi", got["requests"]["verdict"] == "PASS")
+    check("requirements mode exit 0 without strict", p.returncode == 0)
+
+    # table alignment: every data row's AGE column starts where the header's does
+    p = run_cli(["--max-delay", "0", "safe-lib", "deprecated-lib"])
+    lines = re.sub(r"\033\[[0-9;]*m", "", p.stdout).splitlines()
+    hdr = lines[0]
+    # "AGE" also occurs inside "PACKAGE" - locate it after the VERDICT column
+    col_age = hdr.find("VERDICT") + len("VERDICT") + 2
+    assert hdr[col_age:col_age + 3] == "AGE"
+    verdict_rows = []
+    for ln in lines[1:]:
+        cells = ln.split()
+        if len(cells) >= 2 and cells[1] in ("PASS", "WARN", "BLOCK", "ERROR"):
+            verdict_rows.append(ln)
+    ages_at_col = []
+    for ln in verdict_rows:
+        cells = ln.split()
+        age_tok = next(c for c in cells if c.endswith("d") or c == "?")
+        ages_at_col.append(ln.find(age_tok) == col_age)
+    check("table rows align with header columns", verdict_rows and all(ages_at_col))
+finally:
+    shutil.rmtree(tmp, ignore_errors=True)
 
 print()
 if failures:

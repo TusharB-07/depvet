@@ -102,3 +102,43 @@ infringing. Matters for companies; flag it, let legal decide.
 < 1000 weekly downloads. Weak signal alone — every package starts at zero —
 but it amplifies every other signal. Never WARN on adoption by itself for
 packages younger than a week that have a real repo.
+
+## 11. Deprecated in place (WARN)
+
+npm exposes a deprecation notice on the package version itself.
+
+**Why:** deprecation does not remove a package — it stays installable and
+its install scripts keep running. `request` is the canonical case: 14M+
+weekly downloads, deprecated since 2020, still pulling downstream projects
+into an unmaintained dependency. Takedown-squats are also often deprecated
+in place rather than deleted, so a deprecation notice on a young
+low-adoption package corroborates the squat verdict.
+
+**Rule:** `deprecated` field present → WARN with the maintainer's message.
+Deprecated + other red flags → the other flags do their own work; the
+notice is surfaced alongside.
+
+## 12. Missing provenance on a brand-new package (WARN, corroborating only)
+
+npm provenance publishes signed attestations linking a package to its build
+(`dist.attestations` in registry metadata).
+
+**Why:** absence on a package that has existed for years means nothing —
+provenance is optional and recent. Absence on a package published *days*
+ago removes the one link that would tie the release to a public repository,
+which matters because fresh-drop + no-repo + single maintainer is exactly
+the profile of Socket/Snyk-tracked credential stealers.
+
+**Rule:** no attestations AND age < fresh-days → WARN. Never warn on the
+absence alone for established packages.
+
+## 13. Yanked release (WARN, PyPI)
+
+Every file of the latest release carries `"yanked": true`.
+
+**Why:** a yank means the maintainer (or PyPI staff) withdrew the release —
+accidental upload, broken artifact, or malicious code removal. Either way
+the "latest" version is not what `pip` resolves by default, and anything
+that pins to it should be questioned.
+
+**Rule:** all files of the latest version yanked → WARN.

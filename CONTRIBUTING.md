@@ -22,8 +22,12 @@ Thanks for helping gate agent installs everywhere. Ground rules:
 ## Style
 
 - Zero dependencies, stdlib only, Python 3.8+ compatible.
-- `python3 -m py_compile scripts/depvet_check.py` must pass; CI runs live
-  registry smoke tests — keep them deterministic (well-known packages).
+- `python3 -m py_compile scripts/depvet_check.py` must pass; CI runs
+  `tests/test_offline.py` and `tests/test_action.py` (both fully offline via
+  fixture files) plus live registry smoke tests — keep those deterministic
+  (well-known packages).
+- New verdict logic needs tests: pure functions go in `tests/test_offline.py`;
+  add fixture files for any new registry field the check reads.
 - SKILL.md stays under ~200 lines; details go to `references/`.
 
 ## Reporting a wrong verdict
