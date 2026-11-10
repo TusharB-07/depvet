@@ -33,6 +33,17 @@ GET https://api.npmjs.org/downloads/point/last-week/<name>
 Returns `{"downloads": N, ...}` for the last 7 days. Scoped packages work
 with the same path shape. A 404 here just means "not tracked yet".
 
+### Weekly downloads in bulk (batch mode)
+```
+GET https://api.npmjs.org/downloads/point/last-week/<name1>,<name2>,...
+```
+Up to **128 unscoped names per request**; answers
+`{"<name>": {"downloads": N}, ...}`. A name the registry does not know comes
+back as `null` — treat that as "unknown" and fall back to per-name queries,
+never as a real count. Scoped packages (`@scope/pkg`) are not supported by
+the bulk endpoint. The bundled checker uses this so an 88-package lockfile
+needs 1 downloads request instead of 88.
+
 ### Lifecycle scripts worth reading
 `preinstall`, `install`, `postinstall`, `prepack`, `postpack`, `prepare`,
 `prepublishOnly`. Any of them is worth a look; dangerous content patterns

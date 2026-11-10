@@ -17,7 +17,7 @@ name: CI
 #     workflow_dispatch:
 #
 # Until then, run CI manually: Actions tab → CI → Run workflow.
-# (The workflow itself is correct — it passed locally: 19/19 offline
+# (The workflow itself is correct — it passed locally: 76/76 offline
 # unit tests + live registry smoke tests.)
 
 on:

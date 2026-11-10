@@ -286,6 +286,204 @@ try:
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
 
+# --------------------------------------------------------------------------
+# Performance layer: bulk download counts, disk cache, pooled HTTP with
+# keep-alive, redirects, gzip, stale-connection retry - plus end-to-end
+# concurrency and caching against a local loopback HTTP server (still offline:
+# nothing leaves 127.0.0.1).
+# --------------------------------------------------------------------------
+
+import gzip as _gzip
+import threading as _threading
+import urllib.parse as _urlparse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+check("bulk_chunks splits by 128",
+      [len(c) for c in mod.bulk_chunks(list(range(300)))] == [128, 128, 44])
+check("bulk_chunks handles empty input", mod.bulk_chunks([]) == [])
+
+m = mod.parse_bulk_downloads(
+    {"a": {"downloads": 5}, "b": None, "c": {"error": "package not found"}},
+    ["a", "b", "c", "d"])
+check("bulk parse keeps integer counts", m["a"] == 5)
+check("bulk parse null/error/missing -> None",
+      m["b"] is None and m["c"] is None and m["d"] is None)
+
+# bulk endpoint served through the fixtures hook
+with tempfile.TemporaryDirectory() as fxdir:
+    bulk_url = "https://api.npmjs.org/downloads/point/last-week/bulk-a,bulk-b,bulk-c"
+    fname = hashlib.sha256(bulk_url.encode()).hexdigest()[:24] + ".json"
+    with open(os.path.join(fxdir, fname), "w") as fh:
+        fh.write(json.dumps({"bulk-a": {"downloads": 10}, "bulk-b": {"downloads": 20},
+                             "bulk-c": {"error": "package not found"}}))
+    old_fx = os.environ.get("DEPVET_FIXTURES")
+    os.environ["DEPVET_FIXTURES"] = fxdir
+    try:
+        got = mod.fetch_weekly_bulk(["bulk-a", "bulk-b", "bulk-c"])
+    finally:
+        if old_fx is None:
+            os.environ.pop("DEPVET_FIXTURES", None)
+        else:
+            os.environ["DEPVET_FIXTURES"] = old_fx
+    check("bulk fetch via fixtures: ints kept, errors -> None",
+          got == {"bulk-a": 10, "bulk-b": 20, "bulk-c": None})
+
+# disk cache: roundtrip, TTL, corruption
+with tempfile.TemporaryDirectory() as cd:
+    old_cd = os.environ.get("DEPVET_CACHE_DIR")
+    os.environ["DEPVET_CACHE_DIR"] = cd
+    try:
+        row = {"name": "cache-pkg", "verdict": "WARN", "flags": [],
+               "warnings": ["w"], "notes": ["n"]}
+        mod.cache_put("npm", "Cache-Pkg", row)
+        got = mod.cache_get("npm", "cache-pkg", 3600)
+        check("cache roundtrip is case-insensitive on name", got == row)
+        check("cache miss for unknown name", mod.cache_get("npm", "unknown-pkg", 3600) is None)
+        check("cache ttl expiry honored", mod.cache_get("npm", "cache-pkg", -1) is None)
+        bad = mod._cache_path("npm", "broken-pkg")
+        os.makedirs(os.path.dirname(bad), exist_ok=True)
+        with open(bad, "w") as fh:
+            fh.write("{definitely not json")
+        check("cache corrupt entry -> miss", mod.cache_get("npm", "broken-pkg", 3600) is None)
+    finally:
+        if old_cd is None:
+            os.environ.pop("DEPVET_CACHE_DIR", None)
+        else:
+            os.environ["DEPVET_CACHE_DIR"] = old_cd
+
+STATS = {"conn": 0, "req": 0, "stale_seen": 0}
+
+
+class FakeRegistry(BaseHTTPRequestHandler):
+    """Minimal npm-ish registry over loopback HTTP/1.1 with keep-alive."""
+    protocol_version = "HTTP/1.1"
+
+    def setup(self):
+        STATS["conn"] += 1
+        super().setup()
+
+    def log_message(self, *args):
+        pass
+
+    def _send(self, code, body=b"", extra=None):
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        if body:
+            self.wfile.write(body)
+
+    def do_GET(self):
+        STATS["req"] += 1
+        p = self.path.split("?")[0]
+        if p == "/stale":
+            if STATS["stale_seen"] == 0:
+                STATS["stale_seen"] = 1
+                self.close_connection = True
+                return  # close without answering -> stale keep-alive socket
+            self._send(200, b'{"ok": true}')
+        elif p == "/redirect":
+            self._send(301, extra={"Location": "/redirect-target"})
+        elif p == "/redirect-target":
+            self._send(200, b"moved-ok")
+        elif p == "/gzip":
+            self._send(200, _gzip.compress(b'{"hello": "gzipped"}'),
+                       extra={"Content-Encoding": "gzip"})
+        elif p == "/stats":
+            self._send(200, json.dumps(STATS).encode())
+        elif p.startswith("/pkg/"):
+            name = _urlparse.unquote(p[5:])
+            if name == "ghost-pkg":
+                self._send(404, b'{"error": "Not Found"}')
+            else:
+                self._send(200, npm_packument().encode())
+        elif p.startswith("/dl/"):
+            out = {}
+            for n in _urlparse.unquote(p[4:]).split(","):
+                out[n] = {"downloads": 0 if n == "ghost-pkg" else 12000}
+            self._send(200, json.dumps(out).encode())
+        else:
+            self._send(404, b'{"error": "no route"}')
+
+
+srv = ThreadingHTTPServer(("127.0.0.1", 0), FakeRegistry)
+srv.daemon_threads = True
+PORT = srv.server_address[1]
+_threading.Thread(target=srv.serve_forever, daemon=True).start()
+try:
+    err, body = mod.fetch_raw("http://127.0.0.1:{}/redirect".format(PORT))
+    check("fetch_raw follows redirects", err is None and body == b"moved-ok")
+
+    err, body = mod.fetch_raw("http://127.0.0.1:{}/gzip".format(PORT))
+    check("fetch_raw decodes gzip bodies",
+          err is None and json.loads(body.decode())["hello"] == "gzipped")
+
+    err, body = mod.fetch_raw("http://127.0.0.1:{}/pkg/ghost-pkg".format(PORT))
+    check("fetch_raw maps 404 to notfound", err == "notfound" and body is None)
+
+    err, body = mod.fetch_raw("http://127.0.0.1:{}/stale".format(PORT))
+    check("fetch_raw recovers from a stale keep-alive socket",
+          err is None and body == b'{"ok": true}' and STATS["stale_seen"] == 1)
+
+    before_req, before_conn = STATS["req"], STATS["conn"]
+    for _ in range(8):
+        err, body = mod.fetch_raw("http://127.0.0.1:{}/stats".format(PORT))
+        assert err is None
+    check("keep-alive reuses one connection across 8 requests",
+          STATS["req"] - before_req == 8 and STATS["conn"] - before_conn <= 1)
+
+    # End-to-end CLI over loopback (no fixtures): concurrency, bulk, cache.
+    SCRIPT = os.path.join(ROOT, "scripts", "depvet_check.py")
+    with tempfile.TemporaryDirectory() as cache_dir:
+        env = {k: v for k, v in os.environ.items() if k != "DEPVET_FIXTURES"}
+        env.update(
+            DEPVET_NPM_REGISTRY="http://127.0.0.1:{}/pkg".format(PORT),
+            DEPVET_NPM_DOWNLOADS="http://127.0.0.1:{}/dl".format(PORT),
+            DEPVET_CACHE_DIR=cache_dir,
+        )
+
+        def run_cli_net(args):
+            return subprocess.run([sys.executable, SCRIPT] + args, capture_output=True,
+                                  text=True, env=env, timeout=60)
+
+        STATS.update(conn=0, req=0, stale_seen=0)
+        p = run_cli_net(["--json", "safe-lib", "warm-lib", "cool-lib", "ghost-pkg"])
+        check("loopback cli exit 2 on BLOCK", p.returncode == 2)
+        out = json.loads(p.stdout)
+        v = {r["name"]: r["verdict"] for r in out["results"]}
+        check("loopback cli verdicts",
+              v == {"safe-lib": "PASS", "warm-lib": "PASS", "cool-lib": "PASS",
+                    "ghost-pkg": "BLOCK"})
+        reqs_first = STATS["req"]
+        # 4 metadata + 1 bulk downloads request; the 404 never needs downloads
+        check("loopback cli request count = bulk(1) + metadata(4)", reqs_first == 5)
+
+        p2 = run_cli_net(["--json", "safe-lib", "warm-lib", "cool-lib", "ghost-pkg"])
+        out2 = json.loads(p2.stdout)
+        v2 = {r["name"]: r["verdict"] for r in out2["results"]}
+        check("cached run returns identical verdicts", v2 == v)
+        check("cached run makes zero server requests", STATS["req"] == reqs_first)
+
+        p3 = run_cli_net(["--json", "--no-cache", "safe-lib"])
+        json.loads(p3.stdout)
+        check("--no-cache queries the registry again", STATS["req"] == reqs_first + 2)
+
+        with tempfile.TemporaryDirectory() as cd2:
+            env2 = dict(env, DEPVET_CACHE_DIR=cd2)
+            p4 = subprocess.run([sys.executable, SCRIPT, "--json", "--workers", "1",
+                                 "safe-lib", "ghost-pkg"], capture_output=True,
+                                text=True, env=env2, timeout=60)
+            out4 = json.loads(p4.stdout)
+            v4 = {r["name"]: r["verdict"] for r in out4["results"]}
+            check("serial --workers 1 matches concurrent verdicts",
+                  p4.returncode == 2 and v4["ghost-pkg"] == "BLOCK"
+                  and v4["safe-lib"] == "PASS")
+finally:
+    srv.shutdown()
+    srv.server_close()
+
 print()
 if failures:
     print(f"{len(failures)} test(s) failed:", *failures, sep="\n  - ")

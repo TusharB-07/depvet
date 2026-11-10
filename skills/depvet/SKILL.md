@@ -59,6 +59,11 @@ Exit codes: `0` all PASS · `1` at least one WARN (with `--strict`) ·
 `2` at least one BLOCK. In CI or non-interactive runs, treat exit `2` as a
 hard stop.
 
+Batch runs are concurrent and verdicts are cached on disk for 24 h
+(`~/.depvet-cache`), so re-vetting a project is instant. Pass `--no-cache`
+when the user asks for the freshest possible registry data. Cached or not,
+the verdict logic is identical.
+
 If the project root contains `.depvetrc.json`, WARN verdicts for allowlisted
 packages are already downgraded to PASS with the review reason recorded.
 BLOCK verdicts are NEVER downgraded by the allowlist — treat every BLOCK as

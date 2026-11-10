@@ -205,12 +205,53 @@ python3 scripts/depvet_check.py --registry pypi requests     # PyPI
 python3 scripts/depvet_check.py --lockfile package-lock.json # whole tree
 python3 scripts/depvet_check.py --requirements requirements.txt
 python3 scripts/depvet_check.py --json react                 # machine-readable
+python3 scripts/depvet_check.py --no-cache react             # bypass the 24h verdict cache
+python3 scripts/depvet_check.py --workers 1 express koa      # sequential, paced lookups
 ```
 
 Exit codes: `0` no red flags · `1` WARN present **with `--strict`** ·
 `2` BLOCK present (always fails) — so CI gates work out of the box.
 JSON output includes one object per package with `verdict`, `flags`,
 `warnings`, `notes`, and `registry`, ready for your own tooling.
+
+## Performance (v1.2)
+
+Same 88-dependency `package-lock.json`, same machine, same network, fresh
+registry data both times (Nov 2026):
+
+| Run | Wall time |
+|---|---|
+| v1.1 — sequential, one package at a time | **85.8 s** |
+| v1.2 — cold (network, no cache) | **2.9 s** |
+| v1.2 — warm (24 h verdict cache) | **0.08 s** |
+
+All three runs return **identical verdicts for all 88 packages** — the diff
+against the old engine is empty. What changed:
+
+- **Concurrent by default** — batches run on 8 worker threads (`--workers N`;
+  `--workers 1` restores the old sequential, paced behavior).
+- **Keep-alive + gzip** — per-thread pooled connections to the registry CDNs,
+  compressed responses, and one automatic retry when a server silently closes
+  an idle socket.
+- **Bulk download counts** — one request answers up to 128 npm names, so an
+  88-package lockfile needs 1 downloads request instead of 88 (scoped names
+  and failed bulk calls fall back to per-name queries).
+- **Disk cache** — verdicts are reused for 24 h (`~/.depvet-cache`; override
+  the location with `DEPVET_CACHE_DIR`). ERROR rows are never cached; use
+  `--no-cache` for the freshest data, `--cache-ttl SECONDS` to tune.
+- **Mirrors / self-hosted registries** — `DEPVET_NPM_REGISTRY`,
+  `DEPVET_NPM_DOWNLOADS`, `DEPVET_PYPI_REGISTRY` point depvet at an
+  Artifactory/Nexus mirror; proxied environments fall back to urllib so
+  `HTTP(S)_PROXY` keeps working.
+
+**Why not Rust?** We evaluated a Rust port for this release and rejected it:
+the wall time is network-bound — waiting on registry CDNs, not computing — so
+threads + connection reuse + caching recover essentially all of it, while the
+zero-dependency, single-file, runs-on-any-Python-3.8 property is exactly what
+makes depvet installable by an agent in seconds. A compiled binary would add
+a build toolchain and distribution matrix for no measurable win. If a
+genuinely CPU-bound use case appears (bulk name screening offline at millions
+of names), a Rust core becomes interesting — see the roadmap.
 
 ## What depvet is not
 
@@ -232,7 +273,10 @@ JSON output includes one object per package with `verdict`, `flags`,
 No. Two GET endpoints per package (registry metadata + download counts), read-only, no auth, no telemetry.
 
 **Will it slow my agent down?**
-One registry round-trip per package, ~200–500 ms. Batches are checked in one pass.
+No — that was v1.2's whole point: lookups run 8-way concurrent over keep-alive
+connections, download counts come from npm's bulk endpoint, and verdicts are
+cached on disk for 24 h. A 90-package lockfile scans in ~3 s cold and ~0.1 s
+warm. Run `--no-cache` when you explicitly want the freshest registry data.
 
 **Why does a 144M-downloads/week package WARN?**
 Because `axios` is factually single-maintainer — the exact profile that made
@@ -255,8 +299,12 @@ typosquat disasters start.
 - [x] GitHub Action for PR-level dependency gating (v1.1)
 - [x] Allowlist for reviewed packages (`.depvetrc.json`) (v1.1)
 - [x] Deprecation / provenance / yanked signals (v1.1)
+- [x] Performance pass: concurrent lookups, bulk downloads API, keep-alive +
+  gzip, disk cache — 88-dep lockfile 85.8 s → 2.9 s cold, 0.08 s warm (v1.2)
 - [ ] Go module proxy + crates.io adapters
 - [ ] MCP server mode (for Claude Desktop and MCP-capable agents)
+- [ ] Optional Rust core for offline bulk-name screening (only if a CPU-bound
+  use case shows up — measured rationale in [Performance](#performance-v12))
 - [ ] `depvet approve` command to manage `.depvetrc.json` interactively
 
 PRs welcome — see [CONTRIBUTING](CONTRIBUTING.md).
