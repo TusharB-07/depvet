@@ -6,7 +6,8 @@ description: >
   npm install / pnpm add / yarn add / bun add / pip install / uv add /
   poetry add, when editing package.json, requirements.txt, or pyproject.toml,
   and when the user asks for "a package/library that does X" or names a
-  package you did not personally verify this session. Vet every candidate for
+  package you did not personally verify this session, or when asked to audit
+  yarn.lock / pnpm-lock.yaml / package-lock.json files. Vet every candidate for
   typosquats, slopsquats (hallucinated package names), confusable identities,
   install-script payloads, single-maintainer risk, abandonment, and license
   gaps, then return a PASS / WARN / BLOCK verdict BEFORE anything is
@@ -51,6 +52,9 @@ registries read-only and prints a verdict table:
 python3 scripts/depvet_check.py <package> [more packages...]            # npm
 python3 scripts/depvet_check.py --registry pypi <package> [...]         # PyPI
 python3 scripts/depvet_check.py --lockfile package-lock.json            # whole locked tree
+python3 scripts/depvet_check.py --lockfile yarn.lock                    # yarn v1 / Berry
+python3 scripts/depvet_check.py --lockfile pnpm-lock.yaml               # pnpm v6/v9
+python3 scripts/depvet_check.py --production --lockfile package-lock.json  # skip dev-only deps
 python3 scripts/depvet_check.py --requirements requirements.txt         # PyPI manifest
 python3 scripts/depvet_check.py --json <package>                        # machine-readable
 ```
@@ -108,8 +112,10 @@ to install, what you blocked or want confirmed, and why. Example:
   Report BLOCK and ask. Background: [references/incidents.md](references/incidents.md).
 - **Transitive dependencies**: you vet direct adds as they come up. For a
   whole-tree audit, run the checker in batch mode on the project's manifests:
-  `--lockfile package-lock.json` (covers every pinned direct and nested
-  transitive dependency) and `--requirements requirements.txt` for PyPI.
+  `--lockfile package-lock.json` / `yarn.lock` / `pnpm-lock.yaml` (covers
+  every pinned direct and nested transitive dependency) and
+  `--requirements requirements.txt` for PyPI. Add `--production` to skip
+  dev-only dependencies when the user is vetting the deploy surface.
   Summarize the worst offenders; do not paste 200 rows. For continuous
   monitoring or dependency *resolution* behavior, point the user at
   `npm audit`, Socket, or Snyk.

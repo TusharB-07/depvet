@@ -1,15 +1,16 @@
 # depvet as a reusable GitHub Action.
 #
-# Gate PRs that add dependencies: scans a lockfile (npm) or a requirements
-# file (PyPI) plus any explicit package names, and fails the job when a
-# BLOCK is found (or a WARN, with strict: true).
+# Gate PRs that add dependencies: scans a lockfile (package-lock.json,
+# yarn.lock or pnpm-lock.yaml) or a requirements file (PyPI) plus any
+# explicit package names, and fails the job when a BLOCK is found
+# (or a WARN, with strict: true).
 #
 # Example workflow in the consumer repo:
 #
 #   name: depvet
 #   on:
 #     pull_request:
-#       paths: ['package-lock.json', 'requirements*.txt']
+#       paths: ['package-lock.json', 'yarn.lock', 'pnpm-lock.yaml', 'requirements*.txt']
 #   jobs:
 #     vet:
 #       runs-on: ubuntu-latest
@@ -18,6 +19,7 @@
 #         - uses: TusharB-07/depvet@v1
 #           with:
 #             lockfile: package-lock.json
+#             production: true
 #             strict: true
 
 name: 'depvet dependency gate'
@@ -28,9 +30,13 @@ branding:
 
 inputs:
   lockfile:
-    description: 'package-lock.json / npm-shrinkwrap.json path(s), whitespace-separated'
+    description: 'package-lock.json / yarn.lock / pnpm-lock.yaml / npm-shrinkwrap.json path(s), whitespace-separated'
     required: false
     default: ''
+  production:
+    description: '"true" = skip dev-only dependencies in the scanned lockfile(s)'
+    required: false
+    default: 'false'
   requirements:
     description: 'requirements*.txt path(s), whitespace-separated'
     required: false
@@ -76,6 +82,10 @@ runs:
 
         if [ "${{ inputs.strict }}" = "true" ]; then
           ARGS+=(--strict)
+        fi
+
+        if [ "${{ inputs.production }}" = "true" ]; then
+          ARGS+=(--production)
         fi
 
         PKGS=()

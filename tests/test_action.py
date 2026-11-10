@@ -29,7 +29,7 @@ try:
     check("action.yml is valid YAML", isinstance(doc, dict))
     check("action uses composite runtime", doc.get("runs", {}).get("using") == "composite")
     check("action declares the expected inputs",
-          {"lockfile", "requirements", "packages", "registry", "strict"} <= set(doc.get("inputs", {})))
+          {"lockfile", "requirements", "packages", "registry", "strict", "production"} <= set(doc.get("inputs", {})))
     script = doc["runs"]["steps"][0]["run"]
 except ImportError:
     print("  --  PyYAML not available, skipping YAML checks (runners have it)")
@@ -67,6 +67,7 @@ try:
         run = run.replace("${{ inputs.packages }}", "safe-lib")
         run = run.replace("${{ inputs.registry }}", "npm")
         run = run.replace("${{ inputs.strict }}", "false")
+        run = run.replace("${{ inputs.production }}", "false")
         path = os.path.join(tmp, "simulated_step.sh")
         with open(path, "w") as fh:
             fh.write(run)
@@ -84,6 +85,7 @@ try:
         run2 = run2.replace("${{ inputs.packages }}", "not-a-package-xyz")
         run2 = run2.replace("${{ inputs.registry }}", "npm")
         run2 = run2.replace("${{ inputs.strict }}", "true")
+        run2 = run2.replace("${{ inputs.production }}", "false")
         path2 = os.path.join(tmp, "simulated_step2.sh")
         with open(path2, "w") as fh:
             fh.write(run2)
@@ -97,6 +99,7 @@ try:
             run3 = run3.replace("${{ inputs.%s }}" % inp, "")
         run3 = run3.replace("${{ inputs.registry }}", "npm")
         run3 = run3.replace("${{ inputs.strict }}", "false")
+        run3 = run3.replace("${{ inputs.production }}", "false")
         path3 = os.path.join(tmp, "simulated_step3.sh")
         with open(path3, "w") as fh:
             fh.write(run3)

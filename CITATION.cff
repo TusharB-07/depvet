@@ -10,10 +10,11 @@ url: "https://github.com/TusharB-07/depvet"
 abstract: >-
   An Agent Skills compatible skill that gates dependency installation for AI
   coding agents. Vets npm and PyPI packages — individually or from whole
-  package-lock.json / requirements.txt manifests — for typosquats,
-  slopsquats, confusable identities, dangerous lifecycle scripts, deprecation,
-  abandonment, and license gaps before an install command runs. Also ships
-  as a reusable GitHub Action (TusharB-07/depvet@v1) for PR-level gating.
+  package-lock.json / yarn.lock / pnpm-lock.yaml / requirements.txt manifests
+  — for typosquats (including scoped near-misses), slopsquats, confusable
+  identities, dangerous lifecycle scripts, deprecation, abandonment, and
+  license gaps before an install command runs. Also ships as a reusable
+  GitHub Action (TusharB-07/depvet@v1) for PR-level gating.
 keywords:
   - agent-skills
   - supply-chain-security
@@ -22,5 +23,5 @@ keywords:
   - npm
   - pypi
 license: MIT
-version: 1.2.0
+version: 1.3.0
 date-released: "2026-11-11"

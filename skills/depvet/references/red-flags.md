@@ -51,7 +51,16 @@ PowerShell, `certutil`, references to `.npmrc` / `.ssh` / `.git-credentials`
 
 **Why:** the Shai-Hulud worm (Nov 2025) propagated via lifecycle scripts and
 stole tokens with TruffleHog; the Sep 2025 npm phishing compromise injected
-code through published packages that ran on install.
+code through published packages that ran on install. Post-install malware
+surged another 61% in H1 2026 alone (340+ catalogued packages), with
+exfiltration moving to **webhook endpoints** (`webhook.site`, Discord
+webhooks), staged droppers (`setup_bun.js` / `bun_environment.js` from
+Shai-Hulud 2.0), and harvesting of **CI/publish tokens** (`GITHUB_TOKEN`,
+`NPM_TOKEN`) and cloud credentials (`~/.aws/credentials`). npm v12 (2026)
+stopped running lifecycle scripts by default — but older installers, scripted
+CI installs and the other package managers still execute them, and they
+remain the #1 first-stage payload. The IOC list is maintained against these
+campaigns: see `SUSPICIOUS_SCRIPT_PATTERNS` in the checker.
 
 **Rule:** any suspicious pattern in a lifecycle script → BLOCK, quoting the
 script line.
@@ -142,3 +151,19 @@ the "latest" version is not what `pip` resolves by default, and anything
 that pins to it should be questioned.
 
 **Rule:** all files of the latest version yanked → WARN.
+
+## 14. Scoped typosquat (WARN, npm)
+
+The package lives under a scope that is 1–2 edits from a well-known scope
+(`@acitons/*` vs `@actions/*`), while the package itself has low adoption.
+
+**Why:** in October–November 2025, `@acitons/artifact` typosquatted
+`@actions/artifact` — the npm package used *inside GitHub Actions workflows*
+— reached ~47k downloads, and its postinstall dropped a binary that read
+`GITHUB_*` variables and exfiltrated CI tokens before a time bomb killed it.
+Scopes are the typosquat surface people forget: devs eyeball the package
+name, not the org prefix. The warning is gated on low adoption so real
+projects with legitimately similar scopes (@nestjsx vs @nestjs) do not warn.
+
+**Rule:** scope distance 1–2 from a popular scope AND weekly < 5000 → WARN
+naming the real scope.

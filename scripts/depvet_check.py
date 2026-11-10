@@ -17,7 +17,10 @@ Usage:
   python3 depvet_check.py react axios lodash          # npm (default)
   python3 depvet_check.py --registry pypi requests    # PyPI
   python3 depvet_check.py --lockfile package-lock.json   # every dep in a lockfile
+  python3 depvet_check.py --lockfile yarn.lock           # yarn v1 / Berry
+  python3 depvet_check.py --lockfile pnpm-lock.yaml      # pnpm v6 / v9
   python3 depvet_check.py --requirements requirements.txt  # every dep, PyPI
+  python3 depvet_check.py --production --lockfile package-lock.json  # skip dev-only deps
   python3 depvet_check.py --json react                # machine-readable
   python3 depvet_check.py --strict react some-lib     # treat WARN as failure
   python3 depvet_check.py --allow axios react         # silence a reviewed WARN
@@ -53,7 +56,7 @@ NPM_DOWNLOADS = os.environ.get("DEPVET_NPM_DOWNLOADS", "https://api.npmjs.org/do
 PYPI_REGISTRY = os.environ.get("DEPVET_PYPI_REGISTRY", "https://pypi.org/pypi")
 
 TIMEOUT = 15
-UA = "depvet/1.2 (agent dependency gate)"
+UA = "depvet/1.3 (agent dependency gate)"
 
 # Performance defaults: batches run on a small thread pool with per-thread
 # keep-alive connections and gzip; npm weekly-download counts are fetched in
@@ -68,7 +71,9 @@ CACHE_TTL_DEFAULT = 86400
 # welcome: keep sorted, lowercase.
 # --------------------------------------------------------------------------
 POPULAR_NPM = """
-@angular/core @aws-sdk/client-s3 @babel/core @babel/preset-env @babel/runtime
+@actions/artifact @actions/cache @actions/core @actions/exec @actions/github
+@actions/glob @actions/io @actions/tool-cache @actions/upload-artifact
+@actions/download-artifact @angular/core @aws-sdk/client-s3 @babel/core @babel/preset-env @babel/runtime
 @emotion/react @eslint/js @material-ui/core @nestjs/common @nestjs/core
 @ngrx/store @nx/devkit @playwright/test @prisma/client
 @reduxjs/toolkit @sentry/node @stripe/stripe-js @supabase/supabase-js
@@ -102,6 +107,11 @@ nodemailer twilio @sendgrid/mail nanoid shortid slugify
 dotenv-expand
 """.split()
 
+# npm scopes taken from the popular list above. A *brand-new or low-adoption*
+# package whose scope is a near-miss of one of these (@acitons vs @actions,
+# Nov 2025) is the scoped-typosquat pattern.
+KNOWN_SCOPES = sorted({p.split("/", 1)[0] for p in POPULAR_NPM if p.startswith("@")})
+
 POPULAR_PYPI = """
 requests numpy pandas flask django fastapi boto3 torch tensorflow scikit-learn
 scipy matplotlib seaborn plotly dash streamlit gradio pytest poetry uv
@@ -126,6 +136,10 @@ hypothesis faker mimesis factory_boy freezegun responses vcrpy
 """.split()
 
 # Patterns that make an install script dangerous. Matched case-insensitively.
+# Maintained against observed in-the-wild payloads: the classic curl|sh and
+# base64 droppers, plus the 2025-2026 wave (Shai-Hulud 1.0/2.0, s1ngularity,
+# @acitons/artifact, WEL1DROPPER): webhook exfil, Discord webhooks, bun
+# payload files, CI/publish token harvesting, env dumping, cloud creds.
 SUSPICIOUS_SCRIPT_PATTERNS = [
     (r"curl\b[^|]*\|\s*(ba)?sh", "downloads and pipes a script into a shell"),
     (r"wget\b[^|]*\|\s*(ba)?sh", "downloads and pipes a script into a shell"),
@@ -139,7 +153,16 @@ SUSPICIOUS_SCRIPT_PATTERNS = [
     (r"iex\s*\(\s*(new-object|invoke)", "downloads/executes PowerShell in memory"),
     (r"certutil\b", "Windows certutil (common malware dropper)"),
     (r"\bssh\b|\bscp\b", "reaches over SSH"),
-    (r"trufflehog|gitleaks|\.git-credentials|\.npmrc|\.ssh", "targets credentials"),
+    (r"trufflehog|gitleaks|\.git-credentials|\.npmrc|\.ssh|\.aws\b|aws[/\\]credentials",
+     "targets credentials"),
+    (r"\b(GITHUB_TOKEN|GH_TOKEN|NPM_TOKEN|NODE_AUTH_TOKEN|GITLAB_TOKEN|CI_JOB_TOKEN)\b",
+     "reads CI/registry publish tokens"),
+    (r"printenv|\benv\b\s*\|", "dumps environment variables"),
+    (r"webhook\.site|discord(app)?\.com/api/webhooks|discordapp\.com/api/webhooks"
+     r"|pipedream\.net|requestbin\b|interact\.sh|app\.github\.dev",
+     "exfiltrates to a webhook/harvest endpoint"),
+    (r"setup_bun|bun_environment",
+     "drops the Shai-Hulud worm's bun payload files"),
     (r"https?://", "contacts a remote URL during install"),
 ]
 
@@ -393,6 +416,169 @@ def parse_package_lock(doc):
     return []
 
 
+def parse_package_lock_entries(doc):
+    """Extract (name, is_dev_only) pairs from a package-lock.json dict.
+
+    v2/v3 carry a per-entry "dev"/"devOptional" flag; v1 nodes may set
+    "dev": true on the dependency subtree. A name that appears both with and
+    without a dev flag is NOT dev-only (it is installed for production too).
+    """
+    entries = []
+    pkgs = doc.get("packages")
+    if isinstance(pkgs, dict):
+        for key, val in pkgs.items():
+            if not isinstance(key, str) or key == "":
+                continue  # root entry / malformed
+            parts = key.split("node_modules/")
+            if len(parts) > 1 and parts[-1]:
+                dev = bool(val.get("dev") or val.get("devOptional")) if isinstance(val, dict) else False
+                entries.append((parts[-1], dev))
+        return sorted(set(entries))
+    deps = doc.get("dependencies")
+    if isinstance(deps, dict):
+        def walk(subtree, inherited_dev):
+            for k, v in subtree.items():
+                dev = inherited_dev or (isinstance(v, dict) and bool(v.get("dev")))
+                entries.append((k, dev))
+                if isinstance(v, dict) and isinstance(v.get("dependencies"), dict):
+                    walk(v["dependencies"], dev)
+        walk(deps, False)
+        return sorted(set(entries))
+    return []
+
+
+def split_prod_dev(entries):
+    """Collapse [(name, is_dev)] into {name: is_dev_only}.
+
+    A name counts as dev-only only when EVERY occurrence is dev-flagged."""
+    out = {}
+    for name, is_dev in entries:
+        out[name] = out.get(name, True) and bool(is_dev)
+    return out
+
+
+def parse_package_lock(doc):
+    """Back-compat wrapper: just the names (sorted, deduped)."""
+    return sorted({n for n, _ in parse_package_lock_entries(doc)})
+
+
+def _spec_name(spec: str):
+    """'@babel/core@^7.0.0' -> '@babel/core'; 'ajv@^6.12.4' -> 'ajv'.
+
+    Handles yarn Berry's npm: protocol ('axios@npm:^1.6.0' -> 'axios', alias
+    'foo@npm:bar@^1.0.0' -> 'bar') and skips git/url/workspace specs depvet
+    cannot vet by name."""
+    s = spec.strip().strip('"').strip("'")
+    if not s or s.startswith("__") or "://" in s:
+        return None
+    if "@npm:" in s:
+        left, right = s.rsplit("@npm:", 1)
+        # alias specs point at the real target on the right ('bar@^1.0.0');
+        # plain npm: specs/resolutions keep the left side ('axios', '@babel/core')
+        s = right if "@" in right else left
+    if s.startswith("@"):
+        rest = s[1:]
+        return ("@" + rest.split("@", 1)[0]) if "@" in rest else ("@" + rest if rest else None)
+    if "@" not in s:
+        return s or None  # bare name (Berry resolution lines carry no range)
+    name = s.split("@", 1)[0].strip()
+    return name or None
+
+
+def parse_yarn_lock(text: str):
+    """Parse a yarn.lock (v1 classic or Berry) into (names, dev_names).
+
+    v1 names come from the quoted/unquoted spec headers; Berry names also
+    come from resolution: lines. Yarn lockfiles carry no per-package dev
+    marker, so dev_names is always empty."""
+    names = set()
+    for line in text.splitlines():
+        line = line.rstrip()
+        if not line or line.lstrip().startswith("#"):
+            continue
+        if line.startswith(" ") or line.startswith("\t"):
+            indented = line.strip()
+            if indented.startswith("resolution:"):
+                n = _spec_name(indented.split(":", 1)[1])
+                if n:
+                    names.add(n)
+            continue
+        if line.endswith(":"):
+            for spec in line[:-1].split(","):
+                n = _spec_name(spec)
+                if n:
+                    names.add(n)
+    return sorted(names), []
+
+
+def _pnpm_key_name(key: str):
+    """'axios@1.6.0(underscore@1.13.2)' -> 'axios';
+    \"'@babel/core@7.24.0(core-js@3.6.5)'\" -> '@babel/core'."""
+    k = key.strip().strip("'").strip('"')
+    if not k:
+        return None
+    if k.startswith("@"):
+        head = k[1:].split("@", 1)[0]
+        return ("@" + head) if head else None
+    if "@" not in k:
+        return None
+    return k.split("@", 1)[0] or None
+
+
+def parse_pnpm_lock(text: str):
+    """Parse a pnpm-lock.yaml (v6/v9, tolerant of v5) into (names, dev_names).
+
+    Root dependencies:/devDependencies:/optionalDependencies: sections give
+    direct deps (devDependencies feed dev_names); the flat packages:/
+    snapshots: maps give the full tree."""
+    names, dev = set(), set()
+    section = None
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        if not line or line.lstrip().startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        stripped = line.strip()
+        if indent == 0:
+            section = stripped[:-1] if stripped.endswith(":") else None
+            continue
+        if indent != 2:
+            continue
+        if section in ("dependencies", "devDependencies", "optionalDependencies"):
+            key = stripped.split(":", 1)[0].strip().strip("'").strip('"')
+            name = _pnpm_key_name(key if "@" in key else key + "@")  # bare or name@range
+            if name:
+                names.add(name)
+                if section == "devDependencies":
+                    dev.add(name)
+        elif section in ("packages", "snapshots"):
+            if stripped.endswith(":"):
+                n = _pnpm_key_name(stripped[:-1])
+                if n:
+                    names.add(n)
+    return sorted(names), sorted(dev & names)
+
+
+def parse_lockfile(path: str, text: str):
+    """Dispatch a lockfile by filename, falling back to content sniffing.
+    Returns [(name, is_dev_only)]. Raises ValueError on unknown formats."""
+    base = os.path.basename(path).lower()
+    if base.endswith(".json"):
+        return parse_package_lock_entries(json.loads(text))
+    if base == "yarn.lock":
+        return [(n, False) for n in parse_yarn_lock(text)[0]]
+    if base == "pnpm-lock.yaml":
+        return [(n, n in set(parse_pnpm_lock(text)[1])) for n in parse_pnpm_lock(text)[0]]
+    head = text.lstrip()[:400]
+    if head.startswith("{"):
+        return parse_package_lock_entries(json.loads(text))
+    if "yarn lockfile" in head or head.startswith("# THIS IS AN AUTOGENERATED FILE"):
+        return [(n, False) for n in parse_yarn_lock(text)[0]]
+    if head.startswith("lockfileVersion:"):
+        return [(n, n in set(parse_pnpm_lock(text)[1])) for n in parse_pnpm_lock(text)[0]]
+    raise ValueError("unrecognized lockfile format (tried package-lock.json, yarn.lock, pnpm-lock.yaml)")
+
+
 def parse_requirements_line(line: str):
     """Parse one requirements.txt line into a bare package name (or None).
 
@@ -605,6 +791,23 @@ def check_npm(name: str, opts):
                      f"(weekly downloads of '{name}': {weekly if weekly is not None else '?'}). "
                      f"Did you mean '{close}'?")
 
+    # Scoped typosquat: a near-miss of a well-known scope (@acitons vs
+    # @actions, Nov 2025 - the @actions/artifact typosquat exfiltrated CI
+    # tokens from 47k installs before it was pulled). Warning-tier, gated on
+    # low adoption like the name-distance rule above.
+    if name.startswith("@") and "/" in name and (weekly is None or weekly < 5000):
+        scope = name.split("/", 1)[0].lower()
+        if scope not in KNOWN_SCOPES:
+            cs = canon(scope)
+            best_scope, best_d = None, 99
+            for s in KNOWN_SCOPES:
+                d = levenshtein(cs, canon(s))
+                if d < best_d:
+                    best_scope, best_d = s, d
+            if best_scope and 1 <= best_d <= 2:
+                warnings.append(f"scope '{scope}' is {best_d} edit(s) from popular scope '{best_scope}' - "
+                                f"scoped typosquat pattern (cf. @acitons/artifact, Nov 2025)")
+
     if script_hits:
         for key, why in script_hits:
             flags.append(f"'{key}' install script {why}: {scripts.get(key)[:120]!r}")
@@ -790,7 +993,11 @@ def main():
     ap.add_argument("--registry", choices=["npm", "pypi"], default=None,
                     help="defaults to npm for names, pypi for --requirements, npm for --lockfile")
     ap.add_argument("--lockfile", action="append", metavar="FILE",
-                    help="vet every dependency in a package-lock.json / npm-shrinkwrap.json (repeatable)")
+                    help="vet every dependency in a package-lock.json / yarn.lock / "
+                         "pnpm-lock.yaml / npm-shrinkwrap.json (repeatable)")
+    ap.add_argument("--production", action="store_true",
+                    help="skip dev-only dependencies (package-lock dev flags; pnpm "
+                         "devDependencies; no-op for yarn.lock, which marks none)")
     ap.add_argument("--requirements", action="append", metavar="FILE",
                     help="vet every dependency in a requirements*.txt file (repeatable)")
     ap.add_argument("--allow", action="append", metavar="NAME",
@@ -815,16 +1022,29 @@ def main():
     for path in opts.lockfile or []:
         try:
             with open(path, "r", encoding="utf-8") as fh:
-                doc = json.load(fh)
-        except (OSError, ValueError) as e:
+                text = fh.read()
+        except OSError as e:
             print(f"depvet: cannot read lockfile {path}: {e}", file=sys.stderr)
             sys.exit(3)
-        names = parse_package_lock(doc)
-        if not names:
-            print(f"depvet: no dependencies found in {path} (not a package-lock.json?)", file=sys.stderr)
+        try:
+            entries = parse_lockfile(path, text)
+        except ValueError as e:
+            print(f"depvet: cannot parse lockfile {path}: {e}", file=sys.stderr)
             sys.exit(3)
-        jobs += [("npm", n) for n in names]
-        sources.append(f"{len(names)} deps from {path}")
+        if not entries:
+            print(f"depvet: no dependencies found in {path} (not a recognized lockfile?)", file=sys.stderr)
+            sys.exit(3)
+        dev_only = split_prod_dev(entries)
+        picked = sorted(n for n, is_dev in dev_only.items() if not (opts.production and is_dev))
+        skipped = len(dev_only) - len(picked)
+        if not picked:
+            print(f"depvet: every dependency in {path} is dev-only (--production)", file=sys.stderr)
+            sys.exit(3)
+        jobs += [("npm", n) for n in picked]
+        src = f"{len(picked)} deps from {path}"
+        if skipped:
+            src += f" ({skipped} dev-only skipped)"
+        sources.append(src)
 
     for path in opts.requirements or []:
         try:

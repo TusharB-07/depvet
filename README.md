@@ -24,14 +24,25 @@ of every big supply-chain failure of the last decade:
 - **Sep 2025 npm compromise** — one phished maintainer; malware in packages
   with billions of weekly downloads; self-propagating.
 - **Shai-Hulud worm (Nov 2025)** — 100+ packages (Zapier, PostHog, AsyncAPI,
-  ENS…) infected via lifecycle scripts and stolen tokens.
+  ENS…) infected via lifecycle scripts and stolen tokens; exfiltrated through
+  `webhook.site` and GitHub Actions; Shai-Hulud 2.0 shipped staged
+  `setup_bun.js` droppers.
+- **`@acitons/artifact` (Nov 2025)** — typosquatted the *scope* of GitHub's
+  own Actions package, collected CI tokens from ~47k installs through a
+  postinstall payload with a time bomb. Nobody reads the org prefix.
+- **WEL1DROPPER (Aug 2026)** — 1,000+ npm packages under AI-slop typo names
+  delivering a remote-access trojan: slopsquatting went industrial.
 - **Slopsquatting (OWASP-documented)** — attackers publish malicious packages
   under the *hallucinated names* that AI assistants invent. Your agent is the
   attack surface.
 
-`npm audit` scans *after* you depend on something. Snyk and Socket watch repos
-and registries continuously. **Nobody gates the moment the agent decides to
-install.** depvet is that gate.
+Postinstall-script malware grew another **61% in H1 2026** alone. `npm audit`
+scans *after* you depend on something — and the community consensus is that
+it is broken-by-design anyway (Dan Abramov's writeup; Reddit: "npm audit
+passes clean on packages that are actively compromised — these tools check a
+database of known issues"). Snyk and Socket watch repos and registries
+continuously. **Nobody gates the moment the agent decides to install.**
+depvet is that gate.
 
 ## What it does
 
@@ -45,16 +56,20 @@ returns a verdict:
 | **BLOCK** | Typosquat / confusable name / nonexistent name / dangerous install scripts / fresh-drop — **do not install, propose the real alternative** |
 
 Checks performed on every candidate: confusable identity (separator/case
-variants of famous names), edit-distance ≤ 2 from top packages, registry
+variants of famous names), edit-distance ≤ 2 from top packages, **scoped
+near-misses of well-known scopes** (`@acitons` vs `@actions`), registry
 existence (slopsquat path), lifecycle-script payloads (`curl|sh`, `base64`,
-`eval`, credential paths…), package age, weekly downloads, maintainer count,
+`eval`, credential paths, webhook exfil endpoints, CI-token harvesting,
+Shai-Hulud bun droppers…), package age, weekly downloads, maintainer count,
 repository presence, abandonment, npm deprecation notices, PyPI yanked
 releases, provenance attestations, and license.
 
-It also scans **whole manifests** — `package-lock.json` (v1/v2/v3, direct and
-nested transitive deps) and `requirements.txt` — because event-stream and
+It also scans **whole manifests** — `package-lock.json` (v1/v2/v3),
+`yarn.lock` (v1 + Berry, incl. `npm:` aliases), `pnpm-lock.yaml` (v6/v9,
+peer-suffixed snapshots) and `requirements.txt` — because event-stream and
 eslint-scope both arrived through the dependency tree, not through a direct
-add.
+add. `--production` skips dev-only dependencies so you can vet just the
+deploy surface.
 
 ## Real output (not a mockup)
 
@@ -82,9 +97,13 @@ zero configuration.
 ## Scan a whole lockfile or requirements file
 
 Most compromises arrive as **transitive** dependencies. One command vets
-every package in the locked tree (npm v1/v2/v3) or requirements file:
+every package in the locked tree — npm (`package-lock.json` v1/v2/v3),
+yarn (`yarn.lock` v1 + Berry), pnpm (`pnpm-lock.yaml` v6/v9) — or a
+requirements file:
 
 `python3 scripts/depvet_check.py --lockfile package-lock.json`
+`python3 scripts/depvet_check.py --lockfile yarn.lock --production`
+`python3 scripts/depvet_check.py --lockfile pnpm-lock.yaml --production`
 
 Real run — a demo lockfile containing `express`, `lodash`, the deprecated
 `event-stream`, and the `crossenv` typosquat hiding as a nested dep:
@@ -116,6 +135,23 @@ request  WARN     5771d  13,964,396/wk  4      yes      Apache-2.0
     [WARN]  latest version published 6+ year(s) ago (possibly abandoned)
 ```
 
+## How it compares
+
+Grounded in what developers actually report about these tools:
+
+| Tool | Gates the install? | Novel malware? | Noise profile | Cost |
+|---|---|---|---|---|
+| **depvet** | **yes — the moment of install / PR** | yes (name + behavior signals, no advisory DB needed) | BLOCK needs strong evidence; WARN is explainable; allowlist for reviewed packages | free, zero-dep |
+| `npm audit` | no — audits what you already installed | no (advisory DB only) | 99%+ false-positive rate documented (dev-dep noise, duplicate paths) — "broken by design" (Dan Abramov) | free |
+| Snyk | no | advisory DB + own research | commercial SCA; needs account/agent | paid tiers |
+| Socket | no — continuous monitoring | yes (behavioral) | low | commercial; free tier for OSS |
+| Phylum | — | was behavioral | — | **acquired by Veracode (Jan 2025), folded into a commercial SCA suite** |
+
+depvet is not trying to replace continuous monitors — see [What depvet is
+not](#what-depvet-is-not). It closes the specific gap everyone else leaves
+open: **the gate at the moment a package is chosen**, which is exactly where
+agents operate.
+
 ## Gate your CI
 
 depvet ships as a reusable GitHub Action. Add this to the repo you want
@@ -126,7 +162,7 @@ on any WARN too):
 name: depvet
 on:
   pull_request:
-    paths: ['package-lock.json', 'requirements*.txt']
+    paths: ['package-lock.json', 'yarn.lock', 'pnpm-lock.yaml', 'requirements*.txt']
 jobs:
   vet:
     runs-on: ubuntu-latest
@@ -135,6 +171,7 @@ jobs:
       - uses: TusharB-07/depvet@v1
         with:
           lockfile: package-lock.json
+          production: true
           strict: true
 ```
 
@@ -202,7 +239,10 @@ Or use the checker standalone (it is a normal CLI):
 ```bash
 python3 scripts/depvet_check.py express koa fastify          # npm
 python3 scripts/depvet_check.py --registry pypi requests     # PyPI
-python3 scripts/depvet_check.py --lockfile package-lock.json # whole tree
+python3 scripts/depvet_check.py --lockfile package-lock.json # whole tree (npm)
+python3 scripts/depvet_check.py --lockfile yarn.lock         # whole tree (yarn v1/Berry)
+python3 scripts/depvet_check.py --lockfile pnpm-lock.yaml    # whole tree (pnpm v6/v9)
+python3 scripts/depvet_check.py --production --lockfile package-lock.json  # skip dev-only deps
 python3 scripts/depvet_check.py --requirements requirements.txt
 python3 scripts/depvet_check.py --json react                 # machine-readable
 python3 scripts/depvet_check.py --no-cache react             # bypass the 24h verdict cache
@@ -288,6 +328,20 @@ No. It only silences *already-surfaced* WARNs, records who/why, and cannot
 touch BLOCK verdicts (confusable names, dangerous scripts, nonexistent
 packages, fresh drops).
 
+**npm 12 stopped running lifecycle scripts by default — is this obsolete?**
+No, for four reasons: scripts still run on npm < 12, scripted CI installs,
+yarn/pnpm/bun defaults and every package that opts in; the 2025-26 incident
+wave (Shai-Hulud, s1ngularity, @acitons) was *entirely* script-driven;
+half of depvet's checks don't involve scripts at all (identity, distance,
+scope, 404/slopsquat, age, maintainers, license); and a package that runs
+its own scripts still deserves a look before you hand it your machine.
+
+**Why check scopes like `@acitons` against popular scopes?**
+Because `@acitons/artifact` (a real Nov 2025 typosquat of
+`@actions/artifact`, used in GitHub Actions workflows) collected ~47k
+installs and CI tokens before anyone noticed. depvet warns when a young,
+low-adoption package sits under a scope that is 1-2 edits from a famous one.
+
 **Can the agent override a BLOCK?**
 No. Only the user can, explicitly. If the user overrides two lookalike-name
 blocks in one session, the skill stops and re-verifies — that pattern is how
@@ -301,6 +355,12 @@ typosquat disasters start.
 - [x] Deprecation / provenance / yanked signals (v1.1)
 - [x] Performance pass: concurrent lookups, bulk downloads API, keep-alive +
   gzip, disk cache — 88-dep lockfile 85.8 s → 2.9 s cold, 0.08 s warm (v1.2)
+- [x] `yarn.lock` (v1 + Berry) and `pnpm-lock.yaml` (v6/v9) batch mode,
+  `--production` dev-only filtering (v1.3)
+- [x] 2025-26 IOC wave in install-script checks: webhook exfil endpoints,
+  Discord webhooks, CI/publish token harvesting, Shai-Hulud bun droppers,
+  cloud credential paths (v1.3)
+- [x] Scoped typosquat detection (`@acitons` vs `@actions` pattern) (v1.3)
 - [ ] Go module proxy + crates.io adapters
 - [ ] MCP server mode (for Claude Desktop and MCP-capable agents)
 - [ ] Optional Rust core for offline bulk-name screening (only if a CPU-bound

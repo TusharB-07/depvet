@@ -31,6 +31,7 @@ Rules:
 | License gap (§9) | internal tool, user accepts legal review |
 | Low adoption (§10) alone | brand new but published by a team the user knows |
 | Age < 63 days | user is the author, or vetted the repo themselves |
+| Scoped typosquat (§14) | user confirms the scope is the one they meant |
 
 Never merge a WARN into a PASS silently. The report shows WARN rows even
 when everything proceeds.
